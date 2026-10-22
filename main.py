@@ -142,11 +142,24 @@ def validate_decision(d: dict[str, Any], p: dict[str, Any]) -> None:
     if not isinstance(f.get("currency"), str) or not re.fullmatch(r"[A-Z]{3}", f["currency"]):
         raise ValueError("invalid currency")
     refs = d.get("evidenceRefs")
-    if not isinstance(refs, list) or len(refs) != 3 or not all(isinstance(r, str) for r in refs):
-        raise ValueError("need three evidence refs")
-    text = json.dumps(p, ensure_ascii=False)
-    if any(not re.fullmatch(r"\[[^\[\]]+\]", r) or r not in text for r in refs):
-        raise ValueError("evidence reference not found")
+    if (
+        not isinstance(refs, list)
+        or len(refs) != 3
+        or not all(isinstance(r, str) for r in refs)
+        or len(set(refs)) != 3
+    ):
+        raise ValueError("need three distinct evidence refs")
+    documents = p.get("documents")
+    declared_refs = {
+        doc.get("reference")
+        for doc in documents
+        if isinstance(doc, dict) and isinstance(doc.get("reference"), str)
+    } if isinstance(documents, list) else set()
+    if any(
+        not re.fullmatch(r"\[[^\[\]]+\]", r) or r not in declared_refs
+        for r in refs
+    ):
+        raise ValueError("evidence reference must match a document reference")
     why = d.get("rationale")
     if not isinstance(why, str) or not 60 <= len(why) <= 1500 or d["action"] not in why:
         raise ValueError("invalid rationale")

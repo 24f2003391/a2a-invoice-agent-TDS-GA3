@@ -108,6 +108,45 @@ class InvoiceAgentContractTests(unittest.TestCase):
             }],
         }
 
+    def test_decision_requires_three_distinct_declared_evidence_refs(self):
+        package = {
+            "packageId": "pkg-evidence",
+            "documents": [
+                {"reference": "[R1]", "text": "Invoice identity"},
+                {"reference": "[R2]", "text": "Purchase order evidence"},
+                {"reference": "[R3]", "text": "Verification remains pending"},
+                # Mentioning a bracketed string in prose must not make it a valid document ref.
+                {"reference": "[R4]", "text": "Quoted email contains [NOT-A-REFERENCE]"},
+            ],
+        }
+        decision = {
+            "packageId": "pkg-evidence",
+            "action": "hold_invoice",
+            "facts": {
+                "vendorName": "Example Vendor",
+                "invoiceNumber": "INV-100",
+                "amountMinor": 12345,
+                "currency": "INR",
+            },
+            "evidenceRefs": ["[R1]", "[R2]", "[R3]"],
+            "rationale": (
+                "hold_invoice because verification remains pending; "
+                "[R1] identifies the invoice and [R3] records the unresolved check."
+            ),
+        }
+        # The normal case remains valid.
+        main.validate_decision(decision, package)
+
+        repeated = dict(decision, evidenceRefs=["[R1]", "[R1]", "[R3]"])
+        with self.assertRaises(ValueError):
+            main.validate_decision(repeated, package)
+
+        prose_only_ref = dict(
+            decision, evidenceRefs=["[R1]", "[R2]", "[NOT-A-REFERENCE]"]
+        )
+        with self.assertRaises(ValueError):
+            main.validate_decision(prose_only_ref, package)
+
     def test_agent_card_and_authentication(self):
         card_response = self.client.get("/.well-known/agent-card.json")
         self.assertEqual(card_response.status_code, 200)

@@ -1,0 +1,52 @@
+name: Python smoke checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Compile Python source
+        run: python -m py_compile main.py
+
+      - name: Import app and verify required routes
+        env:
+          BASE_URL: https://example.test/a2a/
+          DB_PATH: /tmp/a2a-invoice-agent-ci.sqlite3
+        run: |
+          python - <<'PY'
+          import json
+          import main
+
+          paths = {route.path for route in main.app.routes}
+          required = {
+              "/.well-known/agent-card.json",
+              "/a2a/message:send",
+              "/a2a/tasks",
+              "/a2a/tasks/{task_id}",
+              "/a2a/tasks/{task_id}:cancel",
+          }
+          missing = required - paths
+          assert not missing, f"Missing routes: {sorted(missing)}"
+
+          card = json.loads(main.agent_card().body)
+          assert card["supportedInterfaces"][0]["url"] == "https://example.test/a2a/"
+          assert "application/vnd.ga5.invoice-claim-batch+json" in card["defaultInputModes"]
+          assert len(card["defaultOutputModes"]) == 2
+          print("Python import, Agent Card and required routes passed.")
+          PY

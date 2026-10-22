@@ -7,13 +7,13 @@ This repository contains a FastAPI implementation for the supplied A2A invoice-a
 1. Create a Gemini API key in Google AI Studio, or adapt `call_ai_for_batch` to another provider.
 2. Set `GEMINI_API_KEY` as a Render environment variable. Never commit the key to GitHub.
 3. After Render supplies the public HTTPS service URL, set `BASE_URL` to the exact submitted base URL, including `/a2a/`, for example `https://your-service.onrender.com/a2a/`.
-4. Keep one Uvicorn worker for the process-level cancellation/result lock.
+4. Keep exactly one Uvicorn worker: the cancellation/result race uses a process-level lock plus SQLite transactions.
 5. Submit the exact same base URL in the grader.
 
 ## Deploy on Render
 
 - Build command: `pip install -r requirements.txt`
-- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
+- Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1`
 
 ## Endpoints
 

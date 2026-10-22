@@ -24,6 +24,10 @@ This repository contains a FastAPI implementation for the supplied A2A invoice-a
 
 The agent proposes actions only. It creates a receipt artifact only after a result continuation matches stored proposals and contains grader-supplied receipt nonces. Rejected proposals are retained in history but not executed.
 
+## Automated checks
+
+GitHub Actions compiles the app and runs contract tests for the Agent Card, authentication, proposal/receipt lifecycle, idempotency conflicts, user isolation, and the cancellation-versus-receipt race. These tests use a stubbed decision function, so they do not prove AI decision accuracy against the hidden invoice cases.
+
 ## Important limitations
 
 The assignment text provided to this repository did not include the actual invoice package examples or the internal document schema. The implementation passes each package as JSON to the model and validates the typed output, but decision accuracy and evidence references must be checked against the real sample packages before using graded Check/Save attempts.

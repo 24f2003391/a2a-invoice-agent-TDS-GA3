@@ -25,7 +25,7 @@ _PARSED = urlparse(BASE_URL)
 BASE_PATH = _PARSED.path.rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "data/agent.sqlite3")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash-lite")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 LOCK = threading.RLock()
 app = FastAPI(title="A2A Invoice Action Agent", version="1.0.0")
 

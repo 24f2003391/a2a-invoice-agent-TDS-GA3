@@ -1,6 +1,9 @@
 """A2A invoice agent. Proposals are not executions; receipts require grader acceptance."""
 from __future__ import annotations
 import copy, hashlib, json, os, re, sqlite3, threading, uuid
+import psycopg
+from psycopg import pq
+from psycopg.rows import dict_row
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +27,7 @@ if not BASE_URL.endswith("/"):
 _PARSED = urlparse(BASE_URL)
 BASE_PATH = _PARSED.path.rstrip("/")
 DB_PATH = os.getenv("DB_PATH", "data/agent.sqlite3")
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite")
 LOCK = threading.RLock()
@@ -53,7 +57,55 @@ def err(code: str, status: int) -> JSONResponse:
     return respond({"error": {"code": code, "message": "Request could not be processed."}}, status)
 
 
-def connect_db() -> sqlite3.Connection:
+class PostgresCompat:
+    """Small adapter allowing the existing DB calls to use PostgreSQL or SQLite."""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, sql: str, params=()):
+        statement = sql.strip()
+        upper = statement.upper()
+
+        # SQLite uses BEGIN IMMEDIATE. PostgreSQL starts a transaction with the
+        # first command, so make a harmless SELECT to begin it when needed.
+        if upper == "BEGIN IMMEDIATE":
+            if self.connection.info.transaction_status == pq.TransactionStatus.IDLE:
+                return self.connection.execute("SELECT 1")
+            return None
+
+        # Translate the one SQLite-specific insert used by the decision cache.
+        if upper.startswith("INSERT OR IGNORE INTO DECISION_CACHE"):
+            sql = sql.replace("INSERT OR IGNORE INTO decision_cache",
+                              "INSERT INTO decision_cache", 1)
+            sql = sql.rstrip().rstrip(";") + " ON CONFLICT (package_hash) DO NOTHING"
+
+        # All SQL parameter placeholders in this app are positional question marks.
+        sql = sql.replace("?", "%s")
+        return self.connection.execute(sql, params)
+
+    def commit(self):
+        return self.connection.commit()
+
+    def rollback(self):
+        return self.connection.rollback()
+
+    def close(self):
+        return self.connection.close()
+
+
+def connect_db():
+    if DATABASE_URL:
+        url = DATABASE_URL
+        if url.startswith("postgres://"):
+            url = "postgresql://" + url[len("postgres://"):]
+        connection = psycopg.connect(
+            url,
+            row_factory=dict_row,
+            connect_timeout=10,
+        )
+        return PostgresCompat(connection)
+
     path = Path(DB_PATH).expanduser()
     path.resolve().parent.mkdir(parents=True, exist_ok=True)
     db = sqlite3.connect(str(path), timeout=30, isolation_level=None)
@@ -64,6 +116,28 @@ def connect_db() -> sqlite3.Connection:
 
 
 def init_db() -> None:
+    if DATABASE_URL:
+        with closing(connect_db()) as db:
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS tasks(
+                  task_id TEXT PRIMARY KEY, context_id TEXT NOT NULL, principal TEXT NOT NULL,
+                  batch_id TEXT NOT NULL, state TEXT NOT NULL, task_json TEXT NOT NULL,
+                  created_at TEXT NOT NULL, updated_at TEXT NOT NULL)
+            """)
+            db.execute("CREATE INDEX IF NOT EXISTS tasks_owner ON tasks(principal, created_at)")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS idempotency(
+                  principal TEXT NOT NULL, message_id TEXT NOT NULL, content_hash TEXT NOT NULL,
+                  task_id TEXT NOT NULL REFERENCES tasks(task_id),
+                  PRIMARY KEY(principal,message_id))
+            """)
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS decision_cache(
+                  package_hash TEXT PRIMARY KEY, decision_json TEXT NOT NULL, created_at TEXT NOT NULL)
+            """)
+            db.commit()
+        return
+
     with closing(connect_db()) as db:
         db.execute("PRAGMA journal_mode=WAL")
         db.executescript("""
@@ -407,7 +481,7 @@ def continue_task(msg: dict[str, Any], principal: str, mid: str, mhash: str):
             db.execute("INSERT INTO idempotency VALUES(?,?,?,?)", (principal, mid, mhash, tid))
             db.commit()
             return respond({"task": task})
-        except sqlite3.IntegrityError:
+        except (sqlite3.IntegrityError, psycopg.IntegrityError):
             db.rollback()
             return err("IDEMPOTENCY_CONFLICT", 409)
         except Exception:

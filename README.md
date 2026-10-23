@@ -7,7 +7,7 @@ This repository contains a FastAPI implementation for the supplied A2A invoice-a
 1. Create a Gemini API key in Google AI Studio, or adapt `call_ai_for_batch` to another provider.
 2. Set `GEMINI_API_KEY` as a Render environment variable. Never commit the key to GitHub.
 3. After Render supplies the public HTTPS service URL, set `BASE_URL` to the exact submitted base URL, including `/a2a/`, for example `https://your-service.onrender.com/a2a/`.
-4. Keep exactly one Uvicorn worker: the cancellation/result race uses a process-level lock plus SQLite transactions.
+4. Set `DATABASE_URL` in Render to the database's **Internal Database URL**. The app uses PostgreSQL whenever `DATABASE_URL` is set; otherwise it falls back to local SQLite. Keep exactly one Uvicorn worker because cancellation and receipt handling use a process-level lock.
 5. Submit the exact same base URL in the grader.
 
 ## Deploy on Render
@@ -32,4 +32,8 @@ GitHub Actions compiles the app and runs contract tests for the Agent Card, auth
 
 The assignment text provided to this repository did not include the actual invoice package examples or the internal document schema. The implementation passes each package as JSON to the model and validates the typed output, but decision accuracy and evidence references must be checked against the real sample packages before using graded Check/Save attempts.
 
-SQLite retains state across normal requests, but a free Render filesystem may be reset on a restart or redeploy. Use a persistent disk or managed database if persistent storage across restarts is required.
+PostgreSQL is recommended for task state, idempotency records, and the decision cache to survive web-service spin-downs, restarts, and redeploys. In Render, use the **Internal Database URL** for a database in the same region and workspace; do not use the public External Database URL for the hosted service.
+
+Render Free Postgres has a 1 GB limit, expires 30 days after creation, and does not include backups. After expiration there is a 14-day upgrade grace period before the database is deleted. Export or upgrade before expiration. The SQLite fallback on Render's Free web service has an ephemeral filesystem and is not durable.
+
+Set `DATABASE_URL` in the Render web service's environment variables to enable PostgreSQL. This repository does not automatically copy existing SQLite rows into PostgreSQL; synthetic test tasks from before the migration can be discarded.

@@ -21,7 +21,7 @@ A2A_MEDIA = "application/a2a+json"
 ACTIONS = {"settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"}
 # Evidence IDs are embedded in the document text in grader packages; a separate
 # document["reference"] field is optional and often absent.
-EVIDENCE_REF_PATTERN = re.compile(r"\[[A-Za-z0-9][A-Za-z0-9_.:/-]{0,119}\]")
+EVIDENCE_REF_PATTERN = re.compile(r"\[[^\[\]\r\n]{1,160}\]")
 REFERENCE_TEXT_KEYS = ("name", "title", "filename", "fileName", "text", "content", "body",
                        "paragraph", "description", "documentText", "extractedText")
 REFERENCE_METADATA_KEYS = ("title", "name", "filename", "fileName", "type", "category", "kind", "documentType")
@@ -226,17 +226,17 @@ def package_evidence_entries(p: dict[str, Any]) -> list[dict[str, Any]]:
                     ref = match.group(0)
                     # Associate the marker with the surrounding paragraph so fallback
                     # selection can prioritize evidence actually discussing the action.
-                    left = max(value.rfind("\\n", 0, match.start()), value.rfind("\\r", 0, match.start()))
+                    left = max(value.rfind("\n", 0, match.start()), value.rfind("\r", 0, match.start()))
                     right_candidates = [
-                        end for end in (value.find("\\n", match.end()), value.find("\\r", match.end()))
+                        end for end in (value.find("\n", match.end()), value.find("\r", match.end()))
                         if end >= 0
                     ]
                     right = min(right_candidates) if right_candidates else len(value)
                     paragraph = value[left + 1:right].strip()
                     if len(paragraph) < 20:
                         # Multi-line paragraph: extend to the nearest blank-line boundary.
-                        left_blank = value.rfind("\\n\\n", 0, match.start())
-                        right_blank = value.find("\\n\\n", match.end())
+                        left_blank = value.rfind("\n\n", 0, match.start())
+                        right_blank = value.find("\n\n", match.end())
                         paragraph = value[left_blank + 2:right_blank if right_blank >= 0 else len(value)].strip()
                     candidates.append((ref, paragraph[:1200]))
         for ref, evidence_text in candidates:

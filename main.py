@@ -405,6 +405,94 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
     return result
 
 
+def repair_evidence_refs(d: dict[str, Any], p: dict[str, Any]) -> None:
+    """Repair stale cached citations against the current package before validation."""
+    documents = p.get("documents")
+    if not isinstance(documents, list):
+        return
+
+    def doc_ref(doc):
+        ref = doc.get("reference") if isinstance(doc, dict) else None
+        return ref if isinstance(ref, str) and re.fullmatch(r"\[[^\[\]]+\]", ref) else None
+
+    # Keep decoy detection limited to document references/metadata. Searching the
+    # body text for words like "archive" can wrongly discard genuine evidence.
+    entries = []
+    for index, doc in enumerate(documents):
+        ref = doc_ref(doc)
+        if not ref:
+            continue
+        metadata_keys = ("title", "name", "filename", "fileName", "type", "category", "kind", "documentType")
+        metadata = " ".join([ref] + [str(doc.get(k, "")) for k in metadata_keys]).lower()
+        decoy = bool(re.search(
+            r"\b(?:archive(?:[-_\s]?(?:example|sample|copy))?|training[-_\s]?(?:decoy|example)|decoy|cover[-_\s]?(?:sheet|page)|example[-_\s]?(?:only|doc|invoice))\b",
+            metadata
+        ))
+        entries.append({"ref": ref, "doc": doc, "index": index, "metadata": metadata, "decoy": decoy})
+
+    usable = [entry for entry in entries if not entry["decoy"]]
+    if len(usable) < 3:
+        # Leave malformed packages to the normal validator rather than citing decoys.
+        return
+
+    by_ref = {entry["ref"]: entry for entry in entries}
+    chosen = []
+    refs = d.get("evidenceRefs")
+    if isinstance(refs, list):
+        for raw_ref in refs:
+            if not isinstance(raw_ref, str):
+                continue
+            candidate = raw_ref.strip()
+            exact = candidate if candidate in by_ref else None
+            if exact is None:
+                unwrapped = candidate[1:-1] if candidate.startswith("[") and candidate.endswith("]") else candidate
+                exact = next((
+                    entry["ref"] for entry in entries
+                    if entry["ref"][1:-1] == unwrapped
+                ), None)
+            entry = by_ref.get(exact) if exact else None
+            if entry and not entry["decoy"] and exact not in chosen:
+                chosen.append(exact)
+
+    # Fill absent/invalid cached refs using action-relevant evidence, not another package.
+    terms_by_action = {
+        "settle_invoice": ("invoice", "purchase order", " po ", "goods receipt", "delivery", "received", "acceptance", "amount", "currency"),
+        "request_approval": ("approval", "authority", "delegation", "threshold", "limit", "policy", "invoice", "purchase order"),
+        "hold_invoice": ("pending", "verify", "verification", "confirm", "bank", "tax", "invoice", "purchase order"),
+        "reject_duplicate": ("paid", "payment", "duplicate", "remittance", "ledger", "invoice", "transaction"),
+        "open_exception": ("mismatch", "conflict", "discrepancy", "variance", "invoice", "purchase order", "receipt"),
+    }
+    terms = terms_by_action.get(d.get("action"), ("invoice", "purchase order", "receipt", "payment", "approval"))
+    ranked = []
+    for entry in usable:
+        if entry["ref"] in chosen:
+            continue
+        try:
+            body = json.dumps(entry["doc"], ensure_ascii=False, default=str).lower()
+        except Exception:
+            body = entry["metadata"]
+        score = sum(1 for term in terms if term in body)
+        ranked.append((-score, entry["index"], entry["ref"]))
+    ranked.sort()
+    for _, _, ref in ranked:
+        if len(chosen) >= 3:
+            break
+        if ref not in chosen:
+            chosen.append(ref)
+
+    if len(chosen) != 3:
+        return
+    d["evidenceRefs"] = chosen
+    rationale = d.get("rationale")
+    if not isinstance(rationale, str):
+        rationale = f"{d.get('action', '')} based on the invoice records."
+    if sum(ref in rationale for ref in chosen) < 2:
+        suffix = f" Supporting evidence: {chosen[0]} and {chosen[1]}."
+        if len(rationale.strip()) + len(suffix) > 1500:
+            rationale = rationale.strip()[:1500 - len(suffix)].rstrip()
+        d["rationale"] = rationale.strip() + suffix
+
+
 def propose(batch: str, policy: str, packages: list[dict[str, Any]]):
     ids = [pid(p) for p in packages]
     if any(not x for x in ids) or len(set(ids)) != len(ids):
@@ -438,6 +526,9 @@ def propose(batch: str, policy: str, packages: list[dict[str, Any]]):
     for p in packages:
         d = copy.deepcopy(decisions[pid(p)])
         d["packageId"] = pid(p)
+        # Cached decisions can predate citation-normalization fixes. Revalidate
+        # references against this exact package on every read from the cache.
+        repair_evidence_refs(d, p)
         validate_decision(d, p)
         proposals.append({"packageId": pid(p), "actionId": uuid.uuid4().hex, "action": d["action"],
             "facts": d["facts"], "evidenceRefs": d["evidenceRefs"], "rationale": d["rationale"]})

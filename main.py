@@ -303,8 +303,7 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
         valid_refs = []
         if isinstance(refs, list):
             for ref in refs:
-                if (isinstance(ref, str) and ref in declared_refs
-                    and re.fullmatch(r"\\[[^\\[\\]]+\\]", ref) and ref not in valid_refs):
+                if isinstance(ref, str) and ref in declared_refs and ref not in valid_refs:
                     valid_refs.append(ref)
         if isinstance(why, str) and len(valid_refs) >= 2:
             cited_count = sum(ref in why for ref in valid_refs)

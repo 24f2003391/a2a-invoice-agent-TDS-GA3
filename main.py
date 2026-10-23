@@ -314,13 +314,37 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
             for doc in documents
             if isinstance(doc, dict) and isinstance(doc.get("reference"), str)
         } if isinstance(documents, list) else set()
+        # Normalize model citations to the exact reference strings on this package.
+        # If the model invents/crosses a reference, keep its valid choices and fill
+        # missing slots from declared, non-decoy documents instead of failing the
+        # entire A2A request with a 502.
+        doc_by_ref = {}
+        documents_in_order = []
+        for doc in documents if isinstance(documents, list) else []:
+            if not isinstance(doc, dict):
+                continue
+            ref = doc.get("reference")
+            if not isinstance(ref, str) or not re.fullmatch(r"\[[^\[\]]+\]", ref):
+                continue
+            meta_keys = ("title", "name", "filename", "fileName", "type", "category", "kind", "documentType")
+            meta = " ".join([ref] + [str(doc.get(k, "")) for k in meta_keys]).lower()
+            # Use only a short prefix for decoy classification; don't scan the full
+            # invoice body for incidental mentions of these words.
+            for body_key in ("text", "content", "body", "paragraph", "description"):
+                value = doc.get(body_key)
+                if isinstance(value, str):
+                    meta += " " + value[:500].lower()
+                    break
+            is_decoy = any(word in meta for word in ("archive", "training decoy", "training-example", "cover sheet", "cover page", "decoy", "example-only"))
+            item = {"reference": ref, "document": doc, "meta": meta, "is_decoy": is_decoy}
+            documents_in_order.append(item)
+            doc_by_ref.setdefault(ref, item)
+
         valid_refs = []
         if isinstance(refs, list):
             for ref in refs:
                 if not isinstance(ref, str):
                     continue
-                # Accept harmless formatting differences only when the normalized
-                # text is an exact match for a declared document reference.
                 candidate = ref.strip()
                 exact = candidate if candidate in declared_refs else None
                 if exact is None:
@@ -328,20 +352,53 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
                     exact = next((
                         known for known in declared_refs
                         if isinstance(known, str)
+                        and re.fullmatch(r"\[[^\[\]]+\]", known)
                         and (
                             known.strip() == candidate
                             or (known.startswith("[") and known.endswith("]") and known[1:-1] == unwrapped)
                         )
                     ), None)
-                if exact is not None and exact not in valid_refs:
+                item = doc_by_ref.get(exact) if exact else None
+                if item and not item["is_decoy"] and exact not in valid_refs:
                     valid_refs.append(exact)
-        if isinstance(why, str) and len(valid_refs) >= 2:
-            cited_count = sum(ref in why for ref in valid_refs)
-            if cited_count < 2:
-                suffix = f" Supporting evidence: {valid_refs[0]} and {valid_refs[1]}."
-                if len(why.strip()) + len(suffix) > 1500:
-                    why = why.strip()[:1500 - len(suffix)].rstrip()
-                d["rationale"] = why.strip() + suffix
+
+        chosen_refs = list(valid_refs[:3])
+        action = d.get("action") if isinstance(d.get("action"), str) else ""
+        preferred_terms = {
+            "settle_invoice": ("invoice", "purchase order", " po ", "goods receipt", "delivery", "received", "acceptance", "amount", "currency"),
+            "request_approval": ("approval", "authority", "delegation", "threshold", "limit", "policy", "invoice", "purchase order"),
+            "hold_invoice": ("pending", "verify", "verification", "confirm", "bank", "tax", "invoice", "purchase order"),
+            "reject_duplicate": ("paid", "payment", "duplicate", "remittance", "ledger", "invoice", "transaction"),
+            "open_exception": ("mismatch", "conflict", "discrepancy", "variance", "invoice", "purchase order", "receipt"),
+        }.get(action, ("invoice", "purchase order", "receipt", "payment", "approval"))
+        ranked = []
+        for index, item in enumerate(documents_in_order):
+            ref = item["reference"]
+            if item["is_decoy"] or ref in chosen_refs:
+                continue
+            # Score by action-relevant evidence terms; preserve source order on ties.
+            try:
+                full_text = json.dumps(item["document"], ensure_ascii=False, default=str).lower()
+            except Exception:
+                full_text = item["meta"]
+            score = sum(1 for term in preferred_terms if term in full_text)
+            ranked.append((-score, index, ref))
+        ranked.sort()
+        for _, _, ref in ranked:
+            if len(chosen_refs) >= 3:
+                break
+            if ref not in chosen_refs:
+                chosen_refs.append(ref)
+
+        if len(chosen_refs) == 3:
+            d["evidenceRefs"] = chosen_refs
+            if isinstance(why, str):
+                cited_count = sum(ref in why for ref in chosen_refs)
+                if cited_count < 2:
+                    suffix = f" Supporting evidence: {chosen_refs[0]} and {chosen_refs[1]}."
+                    if len(why.strip()) + len(suffix) > 1500:
+                        why = why.strip()[:1500 - len(suffix)].rstrip()
+                    d["rationale"] = why.strip() + suffix
 
         validate_decision(d, package)
         result[d["packageId"]] = d

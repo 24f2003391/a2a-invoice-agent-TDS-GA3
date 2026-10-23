@@ -302,6 +302,7 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
         if not isinstance(d, dict) or d.get("packageId") not in packages_by_id or d["packageId"] in result:
             raise ValueError("duplicate or unknown package ID")
 
+        package = packages_by_id[d["packageId"]]
         # Normalize/correct citations before validation. This is essential for fresh
         # model responses: proposal-time repair happens too late for this code path.
         repair_evidence_refs(d, package)

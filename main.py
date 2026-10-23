@@ -328,14 +328,12 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
                 continue
             meta_keys = ("title", "name", "filename", "fileName", "type", "category", "kind", "documentType")
             meta = " ".join([ref] + [str(doc.get(k, "")) for k in meta_keys]).lower()
-            # Use only a short prefix for decoy classification; don't scan the full
-            # invoice body for incidental mentions of these words.
-            for body_key in ("text", "content", "body", "paragraph", "description"):
-                value = doc.get(body_key)
-                if isinstance(value, str):
-                    meta += " " + value[:500].lower()
-                    break
-            is_decoy = any(word in meta for word in ("archive", "training decoy", "training-example", "cover sheet", "cover page", "decoy", "example-only"))
+            # Classify decoys from their reference/metadata, not invoice prose:
+            # genuine evidence can mention archives or training in its body.
+            is_decoy = bool(re.search(
+                r"\b(?:archive(?:[-_\s]?(?:example|sample|copy))?|training[-_\s]?(?:decoy|example)|decoy|cover[-_\s]?(?:sheet|page)|example[-_\s]?(?:only|doc|invoice))\b",
+                meta
+            ))
             item = {"reference": ref, "document": doc, "meta": meta, "is_decoy": is_decoy}
             documents_in_order.append(item)
             doc_by_ref.setdefault(ref, item)

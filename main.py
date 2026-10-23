@@ -1,6 +1,6 @@
 """A2A invoice agent. Proposals are not executions; receipts require grader acceptance."""
 from __future__ import annotations
-import copy, hashlib, json, logging, os, re, sqlite3, threading, uuid
+import copy, hashlib, json, logging, os, re, sqlite3, threading, time, uuid
 import psycopg
 from psycopg import pq
 from psycopg.rows import dict_row
@@ -191,6 +191,50 @@ def pid(p: dict[str, Any]) -> str | None:
     return v if isinstance(v, str) and v else None
 
 
+def safe_package_shape(p: dict[str, Any]) -> dict[str, Any]:
+    """Return request-shape diagnostics only; never include invoice text or raw references."""
+    docs = p.get("documents")
+    if not isinstance(docs, list):
+        docs = []
+        documents_is_list = False
+    else:
+        documents_is_list = True
+    doc_keys = sorted({key for doc in docs if isinstance(doc, dict) for key in doc.keys()})
+    reference_values = [doc.get("reference") for doc in docs if isinstance(doc, dict) and "reference" in doc]
+    bracketed_refs = [
+        value for value in reference_values
+        if isinstance(value, str) and re.fullmatch(r"\[[^\[\]]+\]", value)
+    ]
+    metadata_keys = ("title", "name", "filename", "fileName", "type", "category", "kind", "documentType")
+    decoy_metadata_count = 0
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        metadata = " ".join(str(doc.get(key, "")) for key in metadata_keys).lower()
+        if re.search(r"\b(?:archive(?:[-_\s]?(?:example|sample|copy))?|training[-_\s]?(?:decoy|example)|decoy|cover[-_\s]?(?:sheet|page)|example[-_\s]?(?:only|doc|invoice))\b", metadata):
+            decoy_metadata_count += 1
+    text_chars = 0
+    for doc in docs:
+        if not isinstance(doc, dict):
+            continue
+        for key in ("text", "content", "body", "paragraph", "description", "documentText", "extractedText"):
+            value = doc.get(key)
+            if isinstance(value, str):
+                text_chars += len(value)
+    return {
+        "packageKeyNames": sorted(p.keys()),
+        "documentsIsList": documents_is_list,
+        "documentCount": len(docs),
+        "documentKeyNames": doc_keys,
+        "referenceFieldCount": len(reference_values),
+        "stringReferenceCount": sum(isinstance(value, str) for value in reference_values),
+        "bracketedReferenceCount": len(bracketed_refs),
+        "uniqueBracketedReferenceCount": len(set(bracketed_refs)),
+        "decoyMetadataCount": decoy_metadata_count,
+        "documentTextChars": text_chars,
+    }
+
+
 def part_data(message: dict[str, Any], media: str):
     parts = message.get("parts")
     if not isinstance(parts, list):
@@ -273,10 +317,24 @@ The following mapping is authoritative. For each package, select exactly THREE d
 ALLOWED REFERENCES BY PACKAGE: {json.dumps(reference_allowlist, ensure_ascii=False, separators=(',', ':'))}
 PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+    request_started = time.monotonic()
+    logging.getLogger("uvicorn.error").info(
+        "AI_REQUEST_START provider=gemini model=%s package_count=%s prompt_chars=%s "
+        "request_json_chars=%s",
+        GEMINI_MODEL, len(packages), len(prompt),
+        len(json.dumps({"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+                        "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 8192}},
+                       ensure_ascii=False, separators=(",", ":")))
+    )
     res = requests.post(url, params={"key": GEMINI_API_KEY},
         json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
               "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 8192}},
         timeout=35)
+    logging.getLogger("uvicorn.error").info(
+        "AI_RESPONSE provider=gemini model=%s status=%s elapsed_ms=%s response_bytes=%s",
+        GEMINI_MODEL, res.status_code, round((time.monotonic() - request_started) * 1000),
+        len(res.content or b"")
+    )
     if not res.ok:
         # Log the provider's diagnostic response, but never log the request URL
         # because the Gemini API key is carried in its query parameters.
@@ -317,6 +375,10 @@ def repair_evidence_refs(d: dict[str, Any], p: dict[str, Any]) -> None:
     """Repair stale cached citations against the current package before validation."""
     documents = p.get("documents")
     if not isinstance(documents, list):
+        logging.getLogger("uvicorn.error").warning(
+            "CITATION_REPAIR_SKIPPED package_hash=%s reason=documents_not_list package_shape=%s",
+            package_digest(p)[:12], json.dumps(safe_package_shape(p), sort_keys=True)
+        )
         return
 
     def doc_ref(doc):
@@ -340,6 +402,12 @@ def repair_evidence_refs(d: dict[str, Any], p: dict[str, Any]) -> None:
 
     usable = [entry for entry in entries if not entry["decoy"]]
     if len(usable) < 3:
+        logging.getLogger("uvicorn.error").warning(
+            "CITATION_REPAIR_SKIPPED package_hash=%s reason=fewer_than_three_usable_refs "
+            "document_count=%s valid_bracketed_refs=%s usable_refs=%s package_shape=%s",
+            package_digest(p)[:12], len(documents), len(entries), len(usable),
+            json.dumps(safe_package_shape(p), sort_keys=True)
+        )
         # Leave malformed packages to the normal validator rather than citing decoys.
         return
 
@@ -390,7 +458,21 @@ def repair_evidence_refs(d: dict[str, Any], p: dict[str, Any]) -> None:
 
     if len(chosen) != 3:
         return
+    original_refs = d.get("evidenceRefs")
+    original_count = len(original_refs) if isinstance(original_refs, list) else 0
+    original_members = sum(
+        isinstance(ref, str) and ref in by_ref and not by_ref[ref]["decoy"]
+        for ref in original_refs
+    ) if isinstance(original_refs, list) else 0
     d["evidenceRefs"] = chosen
+    logging.getLogger("uvicorn.error").info(
+        "CITATION_REPAIR package_hash=%s document_count=%s valid_bracketed_refs=%s "
+        "usable_refs=%s model_ref_count=%s model_ref_members=%s final_ref_count=%s "
+        "repair_changed_refs=%s",
+        package_digest(p)[:12], len(documents), len(entries), len(usable),
+        original_count, original_members, len(chosen),
+        original_refs != chosen
+    )
     rationale = d.get("rationale")
     if not isinstance(rationale, str):
         rationale = f"{d.get('action', '')} based on the invoice records."
@@ -406,6 +488,7 @@ def propose(batch: str, policy: str, packages: list[dict[str, Any]]):
     if any(not x for x in ids) or len(set(ids)) != len(ids):
         raise ValueError("package IDs must be unique")
     decisions, missing = {}, []
+    cache_hits = 0
     with closing(connect_db()) as db:
         for p in packages:
             row = db.execute("SELECT decision_json FROM decision_cache WHERE package_hash=?", (package_digest(p),)).fetchone()
@@ -413,8 +496,13 @@ def propose(batch: str, policy: str, packages: list[dict[str, Any]]):
                 d = json.loads(row["decision_json"])
                 d["packageId"] = pid(p)
                 decisions[pid(p)] = d
+                cache_hits += 1
             else:
                 missing.append(p)
+    logging.getLogger("uvicorn.error").info(
+        "DECISION_CACHE batch_packages=%s cache_hits=%s cache_misses=%s",
+        len(packages), cache_hits, len(missing)
+    )
     if missing:
         fresh = ask_model(batch, policy, missing)
         with closing(connect_db()) as db:
@@ -512,6 +600,14 @@ async def send_message(request: Request):
         if not all(isinstance(p, dict) for p in packages):
             return err("INVALID_PACKAGE", 400)
         try:
+            logging.getLogger("uvicorn.error").info(
+                "INVOICE_BATCH_SHAPE body_bytes=%s batch_id_hash=%s policy_revision_chars=%s package_count=%s package_shapes=%s",
+                len(compact(body)),
+                hashlib.sha256(batch.encode()).hexdigest()[:12],
+                len(str(policy)),
+                len(packages),
+                json.dumps([safe_package_shape(package) for package in packages[:12]], sort_keys=True)
+            )
             proposals = propose(batch, str(policy), packages)
         except requests.RequestException as exc:
             # Do not print exception text: HTTP exceptions can include URLs with API keys.

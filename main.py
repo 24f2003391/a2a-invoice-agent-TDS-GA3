@@ -1,6 +1,6 @@
 """A2A invoice agent. Proposals are not executions; receipts require grader acceptance."""
 from __future__ import annotations
-import copy, hashlib, json, os, re, sqlite3, threading, uuid
+import copy, hashlib, json, logging, os, re, sqlite3, threading, uuid
 import psycopg
 from psycopg import pq
 from psycopg.rows import dict_row
@@ -263,6 +263,16 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
         json={"contents": [{"role": "user", "parts": [{"text": prompt}]}],
               "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json", "maxOutputTokens": 8192}},
         timeout=35)
+    if not res.ok:
+        # Log the provider's diagnostic response, but never log the request URL
+        # because the Gemini API key is carried in its query parameters.
+        try:
+            provider_detail = json.dumps(res.json(), ensure_ascii=False)[:1500]
+        except Exception:
+            provider_detail = res.text[:1500]
+        logging.getLogger("uvicorn.error").error(
+            "Gemini API returned HTTP %s: %s", res.status_code, provider_detail
+        )
     res.raise_for_status()
     parts = res.json().get("candidates", [{}])[0].get("content", {}).get("parts", [])
     raw = "".join(x.get("text", "") for x in parts).strip()
@@ -393,9 +403,18 @@ async def send_message(request: Request):
             return err("INVALID_PACKAGE", 400)
         try:
             proposals = propose(batch, str(policy), packages)
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            # Do not print exception text: HTTP exceptions can include URLs with API keys.
+            logging.getLogger("uvicorn.error").error(
+                "AI_PROVIDER_UNAVAILABLE: request error type=%s", type(exc).__name__
+            )
             return err("AI_PROVIDER_UNAVAILABLE", 502)
-        except Exception:
+        except Exception as exc:
+            # The validation/parser errors use safe, short messages and contain no invoice payload.
+            logging.getLogger("uvicorn.error").error(
+                "DECISION_FAILED: type=%s detail=%s",
+                type(exc).__name__, str(exc)[:400]
+            )
             return err("DECISION_FAILED", 502)
         task = {"kind": "task", "id": str(uuid.uuid4()), "contextId": str(uuid.uuid4()),
                 "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": now()},

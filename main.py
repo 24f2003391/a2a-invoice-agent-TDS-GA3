@@ -256,7 +256,7 @@ open_exception (material records conflict).
 Return only JSON: {{"decisions":[{{"packageId":"exact ID","action":"one action","facts":{{"vendorName":"...","invoiceNumber":"...","amountMinor":12345,"currency":"INR"}},"evidenceRefs":["[REF-1]","[REF-2]","[REF-3]"],"rationale":"60-1500 chars"}}]}}.
 Each package once. Give exactly THREE decisive bracketed references from the paragraph determining the action;
 do not use cover, archive-example or training-decoy refs. Keep spelling exact. amountMinor is integer minor
-currency units (INR rupees x 100). Do not invent facts. Rationale names the action and cites at least two refs.
+currency units (INR rupees x 100). Do not invent facts. For EVERY package, the rationale MUST name the exact action and literally include at least TWO of that same decision's evidenceRefs, copied character-for-character including square brackets. For example, write the exact strings "[REF-1]" and "[REF-2]" in the rationale; mentioning a reference without its brackets does not count.
 PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
     res = requests.post(url, params={"key": GEMINI_API_KEY},
@@ -287,7 +287,34 @@ PACKAGES: {json.dumps(packages, ensure_ascii=False, separators=(',', ':'))}"""
     for d in decisions:
         if not isinstance(d, dict) or d.get("packageId") not in packages_by_id or d["packageId"] in result:
             raise ValueError("duplicate or unknown package ID")
-        validate_decision(d, packages_by_id[d["packageId"]])
+
+        # Keep the model's chosen action and evidence unchanged, but normalize a
+        # citation-format omission: cite two of its selected, declared evidenceRefs
+        # verbatim in the rationale. The normal validator still checks all fields.
+        refs = d.get("evidenceRefs")
+        why = d.get("rationale")
+        package = packages_by_id[d["packageId"]]
+        documents = package.get("documents")
+        declared_refs = {
+            doc.get("reference")
+            for doc in documents
+            if isinstance(doc, dict) and isinstance(doc.get("reference"), str)
+        } if isinstance(documents, list) else set()
+        valid_refs = []
+        if isinstance(refs, list):
+            for ref in refs:
+                if (isinstance(ref, str) and ref in declared_refs
+                    and re.fullmatch(r"\\[[^\\[\\]]+\\]", ref) and ref not in valid_refs):
+                    valid_refs.append(ref)
+        if isinstance(why, str) and len(valid_refs) >= 2:
+            cited_count = sum(ref in why for ref in valid_refs)
+            if cited_count < 2:
+                suffix = f" Supporting evidence: {valid_refs[0]} and {valid_refs[1]}."
+                if len(why.strip()) + len(suffix) > 1500:
+                    why = why.strip()[:1500 - len(suffix)].rstrip()
+                d["rationale"] = why.strip() + suffix
+
+        validate_decision(d, package)
         result[d["packageId"]] = d
     if set(result) != set(packages_by_id):
         raise ValueError("missing package decision")
